@@ -1,0 +1,5 @@
+# debug / capture artifacts
+debug.log
+shot*.png
+window-shot.png
+*.tmp

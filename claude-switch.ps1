@@ -226,7 +226,7 @@ $dragDown = {
 $header.Add_MouseDown($dragDown)
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "Escolha a conta"
+$lblTitle.Text = "Select account"
 $lblTitle.Font = $FONT_TITLE
 $lblTitle.ForeColor = $cText
 $lblTitle.AutoSize = $true
@@ -306,9 +306,9 @@ function Switch-To($account) {
     $now = $fresh | Where-Object { $_.Active } | Select-Object -First 1
     $form.Hide()
     if ($null -ne $now) {
-        $u = if ($now.Unavailable) { "uso indisponivel" }
+        $u = if ($now.Unavailable) { "usage unavailable" }
              else { "5h: $($now.Pct5h)%   7d: $($now.Pct7d)%" }
-        $toast = Show-Toast "Conta trocada" "$($now.Email)`n$u" 5000
+        $toast = Show-Toast "Account switched" "$($now.Email)`n$u" 5000
         Start-Sleep -Seconds 4
         $toast.Dispose()
     }
@@ -404,7 +404,7 @@ function Render {
         $email.AutoSize = $false
         $email.AutoEllipsis = $false
         $email.UseMnemonic = $false
-        $emailW = if ($acc.Active) { $cardW - 44 - 52 } else { $cardW - 44 }
+        $emailW = if ($acc.Active) { $cardW - 44 - 58 } else { $cardW - 44 }
         $email.Size = Sz $emailW 18
         $email.Location = Pt 36 11
         $card.Controls.Add($email)
@@ -432,7 +432,7 @@ function Render {
             $cy = Add-UsageRow $card "7d" $acc.Pct7d $acc.Reset7d $cy $cardW
         } else {
             $un = New-Object System.Windows.Forms.Label
-            $un.Text = "uso indisponivel"
+            $un.Text = "usage unavailable"
             $un.Font = $FONT_USAGE
             $un.ForeColor = $cMuted
             $un.AutoSize = $true
@@ -442,7 +442,7 @@ function Render {
 
         if ($acc.Active) {
             # No button: mark the active card with an accent left stripe and a
-            # small "ativa" badge. It is not clickable.
+            # small "active" badge. It is not clickable.
             $card.Add_Paint({
                 param($s, $e)
                 $b = New-Object System.Drawing.SolidBrush($cAccent)
@@ -451,13 +451,13 @@ function Render {
             }.GetNewClosure())
 
             $badge = New-Object System.Windows.Forms.Label
-            $badge.Text = ([char]0x25CF) + " ativa"
+            $badge.Text = ([char]0x25CF) + " active"
             $badge.Font = $FONT_USAGE
             $badge.ForeColor = $cAccent
             $badge.AutoSize = $false
             $badge.TextAlign = "MiddleRight"
-            $badge.Size = Sz 52 16
-            $badge.Location = Pt ($cardW - 52 - 12) 13
+            $badge.Size = Sz 58 16
+            $badge.Location = Pt ($cardW - 58 - 12) 13
             $card.Controls.Add($badge)
         } else {
             # The whole card is the click target. Wire click + hover + hand

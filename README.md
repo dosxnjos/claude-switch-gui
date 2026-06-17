@@ -6,7 +6,7 @@ CLI (the `cswap` command): on launch it reads `cswap --list` and shows each acco
 as a card with 5h/7d usage. Clicking a card switches the active account
 (`cswap --switch-to N`).
 
-![preview](docs/preview.png)
+![preview](docs/screenshot.png)
 
 ## Features
 

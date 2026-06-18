@@ -218,7 +218,7 @@ $FONT_ORG   = Fnt "Segoe UI"          12 $reg
 $FONT_USAGE = Fnt "Segoe UI"          12 $reg
 $FONT_NUM   = Fnt "Segoe UI Semibold" 13 $reg
 $FONT_TITLE = Fnt "Segoe UI Semibold" 17 $reg
-$FONT_SUBTITLE = Fnt "Segoe UI"       13 $reg
+$FONT_SUBTITLE = Fnt "Segoe UI"       15 $reg
 $FONT_BTN   = Fnt "Segoe UI Semibold" 13 $reg
 $FONT_WINBTN = Fnt "Segoe UI"         15 $reg
 # Segoe UI Symbol renders the recycling glyph monochrome (no color-emoji fallback).
@@ -771,7 +771,8 @@ $script:ovImg = $null
 
 # Animate the overlay from $img@$from to $img@$to over $ms ms.
 function Fade-Overlay($overlay, $img, [double]$from, [double]$to, [int]$ms) {
-    $steps = 8
+    # ~60fps: one step per ~16ms, at least 8 steps.
+    $steps = [math]::Max(8, [int]($ms / 16))
     $dt = [int][math]::Max(1, $ms / $steps)
     $delta = ($to - $from) / $steps
     $a = $from
@@ -838,7 +839,7 @@ function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$
 # load to avoid re-entrancy.
 $btnRefresh.Add_Click({
     if ($script:loading) { return }
-    Swap-Content $flow { $script:accounts = Render } 100 100
+    Swap-Content $flow { $script:accounts = Render } 300 300
 })
 
 $form.Add_Shown({
@@ -876,7 +877,7 @@ $form.Add_Shown({
 
     # 3) Content-only crossfade: fade the loading out, reveal subtitle + cards,
     #    fade them in. The header does not fade.
-    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 100 100
+    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 300 300
     $script:loading = $false
 })
 

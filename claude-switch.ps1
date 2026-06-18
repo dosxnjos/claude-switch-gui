@@ -793,8 +793,13 @@ function Fade-Overlay($overlay, $img, [double]$from, [double]$to, [int]$ms) {
 # overlay is laid over $target, the current pixels fade out to the background,
 # $buildNew runs while hidden, then the new pixels fade in. Whatever is outside
 # $target (the header, and on reload the subtitle) never moves or fades.
-function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$msIn = 100) {
-    $bmpOld = Snapshot-Of $target
+function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$msIn = 100, $oldSource = $null) {
+    # Snapshot for the fade-OUT. Defaults to $target, but the caller can pass a
+    # different control when $target has overlapping children that DrawToBitmap
+    # would composite in the wrong order (e.g. the loading splash sits over the
+    # cards inside $content, but DrawToBitmap($content) renders the cards on top).
+    $src = if ($null -ne $oldSource) { $oldSource } else { $target }
+    $bmpOld = Snapshot-Of $src
     if ($null -eq $bmpOld) { & $buildNew; return }
     $parent = $target.Parent
 
@@ -877,7 +882,9 @@ $form.Add_Shown({
 
     # 3) Content-only crossfade: fade the loading out, reveal subtitle + cards,
     #    fade them in. The header does not fade.
-    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 300 300
+    # $splash overlaps the cards inside $content, so snapshot it explicitly for
+    # the fade-OUT (DrawToBitmap of $content would grab the cards instead).
+    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 300 300 $splash
     $script:loading = $false
 })
 

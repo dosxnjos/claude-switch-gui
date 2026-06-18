@@ -335,6 +335,14 @@ function Position-HeaderButtons($clientW) {
     $btnRefresh.Location = New-Object System.Drawing.Point($xRef,   $yb)
 }
 
+# Content area below the header. Everything that fades during a transition
+# (subtitle, cards, loading splash) lives here, so the header stays static and
+# the open fade-in is the only time the whole window fades.
+$content = New-Object System.Windows.Forms.Panel
+$content.Dock = "Fill"
+$content.BackColor = $cBg
+$form.Controls.Add($content)
+
 # Scrollable flow container: cards sit side by side and wrap to new rows.
 $flow = New-Object System.Windows.Forms.FlowLayoutPanel
 $flow.Dock = "Fill"
@@ -357,9 +365,9 @@ $subLbl.Text = "Select account"
 $subLbl.Font = $FONT_SUBTITLE
 $subLbl.ForeColor = $cSubtle
 $subBar.Controls.Add($subLbl)
-$form.Controls.Add($subBar)
+$content.Controls.Add($subBar)
 
-$form.Controls.Add($flow)
+$content.Controls.Add($flow)
 $flow.BringToFront()
 
 # ---------------------------------------------------------------------------
@@ -410,7 +418,7 @@ $layoutSplash = {
 }.GetNewClosure()
 $splash.Add_Resize($layoutSplash)
 
-$form.Controls.Add($splash)
+$content.Controls.Add($splash)
 $splash.BringToFront()
 
 # Tooltip so the full email/org is available even when the card clips it.
@@ -646,11 +654,9 @@ function Render {
 # ---------------------------------------------------------------------------
 $script:accounts = $null
 
-$btnRefresh.Add_Click({ $script:accounts = Render })
-
-# Animate $form.Opacity from $from to $to over ~$ms milliseconds. Runs on the UI
-# thread (DoEvents keeps it responsive); used for the open fade-in and the
-# loading -> cards crossfade.
+# Animate $form.Opacity from $from to $to over ~$ms ms. Used ONLY for the open
+# fade-in of the whole window. Content transitions use Swap-Content (below) so
+# the header doesn't fade with them.
 function Fade-Form([double]$from, [double]$to, [int]$ms) {
     $steps = 10
     $dt = [int][math]::Max(1, $ms / $steps)
@@ -666,6 +672,108 @@ function Fade-Form([double]$from, [double]$to, [int]$ms) {
     try { $form.Opacity = $to } catch {}
 }
 
+# Returns a $w x $h bitmap: the background with $img drawn over it at $alpha
+# (0..1). WinForms controls have no per-control opacity, so we fake it by
+# alpha-blending a snapshot via a ColorMatrix.
+function Compose-Faded($img, [double]$alpha, [int]$w, [int]$h) {
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $g.Clear($cBg)
+        if ($null -ne $img -and $alpha -gt 0) {
+            $cm = New-Object System.Drawing.Imaging.ColorMatrix
+            $cm.Matrix33 = [single][math]::Min(1.0, $alpha)
+            $ia = New-Object System.Drawing.Imaging.ImageAttributes
+            $ia.SetColorMatrix($cm)
+            $rect = New-Object System.Drawing.Rectangle(0, 0, $w, $h)
+            $g.DrawImage($img, $rect, 0, 0, $img.Width, $img.Height, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+            $ia.Dispose()
+        }
+    } finally { $g.Dispose() }
+    return $bmp
+}
+
+# Snapshot a control's current pixels into a bitmap.
+function Snapshot-Of($ctl) {
+    $w = $ctl.ClientSize.Width; $h = $ctl.ClientSize.Height
+    if ($w -le 0 -or $h -le 0) { return $null }
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $ctl.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $w, $h)))
+    return $bmp
+}
+
+# Current frame painted by the overlay panel (see Swap-Content). We use a Panel
+# with a custom Paint handler rather than a PictureBox: PictureBox runs the
+# ImageAnimator on show, which throws on bitmaps produced by DrawToBitmap.
+$script:ovImg = $null
+
+# Animate the overlay from $img@$from to $img@$to over $ms ms.
+function Fade-Overlay($overlay, $img, [double]$from, [double]$to, [int]$ms) {
+    $steps = 8
+    $dt = [int][math]::Max(1, $ms / $steps)
+    $delta = ($to - $from) / $steps
+    $a = $from
+    $prev = $null
+    for ($i = 0; $i -lt $steps; $i++) {
+        $a += $delta
+        $frame = Compose-Faded $img $a $overlay.Width $overlay.Height
+        $script:ovImg = $frame
+        $overlay.Invalidate(); $overlay.Update()
+        if ($null -ne $prev) { $prev.Dispose() }
+        $prev = $frame
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds $dt
+    }
+}
+
+# Crossfade just $target (e.g. the whole content area, or only the cards): an
+# overlay is laid over $target, the current pixels fade out to the background,
+# $buildNew runs while hidden, then the new pixels fade in. Whatever is outside
+# $target (the header, and on reload the subtitle) never moves or fades.
+function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$msIn = 100) {
+    $bmpOld = Snapshot-Of $target
+    if ($null -eq $bmpOld) { & $buildNew; return }
+    $parent = $target.Parent
+
+    $ov = New-Object System.Windows.Forms.Panel
+    $ov.Bounds = $target.Bounds
+    $ov.BackColor = $cBg
+    # Double-buffer the overlay so the fade doesn't flicker.
+    try { $ov.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic').SetValue($ov, $true, $null) } catch {}
+    $ov.Add_Paint({
+        param($s, $e)
+        if ($null -ne $script:ovImg) { $e.Graphics.DrawImageUnscaled($script:ovImg, 0, 0) }
+    })
+    $script:ovImg = $bmpOld
+    $parent.Controls.Add($ov)
+    $ov.BringToFront()
+    $ov.Invalidate(); $ov.Update()
+    [System.Windows.Forms.Application]::DoEvents()
+
+    Fade-Overlay $ov $bmpOld 1.0 0.0 $msOut
+
+    & $buildNew
+    $form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+
+    # $buildNew may have resized things; re-fit the overlay over the target.
+    $ov.Bounds = $target.Bounds
+    $bmpNew = Snapshot-Of $target
+    Fade-Overlay $ov $bmpNew 0.0 1.0 $msIn
+
+    $parent.Controls.Remove($ov)
+    $ov.Dispose()
+    if ($null -ne $script:ovImg) { $script:ovImg.Dispose(); $script:ovImg = $null }
+    if ($null -ne $bmpOld) { $bmpOld.Dispose() }
+    if ($null -ne $bmpNew) { $bmpNew.Dispose() }
+}
+
+# Refresh: fade only the cards ($flow) out and the freshly-fetched ones in. The
+# header and the "Select account" subtitle stay put.
+$btnRefresh.Add_Click({
+    Swap-Content $flow { $script:accounts = Render } 100 100
+})
+
 $form.Add_Shown({
     # Lay out and paint the loading splash before the blocking cswap call, so the
     # window never shows as a half-drawn gray box.
@@ -675,20 +783,17 @@ $form.Add_Shown({
     $form.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
 
-    # 1) Fade the whole window in, with the loading splash showing.
+    # 1) Open: fade the WHOLE window in (this is the only whole-window fade), with
+    #    the loading splash showing.
     Fade-Form 0.0 1.0 160
 
-    # 2) Load accounts (blocking) while the splash is up.
+    # 2) Load accounts (blocking) while the splash is up. This also resizes the
+    #    window to fit the cards (the splash covers them being built).
     $script:accounts = Render
 
-    # 3) Crossfade: fade the loading out (.1s), swap to the cards, fade in (.1s).
-    Fade-Form 1.0 0.0 100
-    $splash.Visible = $false
-    $subBar.Visible = $true
-    $flow.BringToFront()
-    $form.Refresh()
-    [System.Windows.Forms.Application]::DoEvents()
-    Fade-Form 0.0 1.0 100
+    # 3) Content-only crossfade: fade the loading out, reveal subtitle + cards,
+    #    fade them in. The header does not fade.
+    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 100 100
 })
 
 # number keys 1..9 switch; Esc closes

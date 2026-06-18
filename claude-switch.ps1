@@ -218,7 +218,7 @@ $FONT_ORG   = Fnt "Segoe UI"          12 $reg
 $FONT_USAGE = Fnt "Segoe UI"          12 $reg
 $FONT_NUM   = Fnt "Segoe UI Semibold" 13 $reg
 $FONT_TITLE = Fnt "Segoe UI Semibold" 17 $reg
-$FONT_SUBTITLE = Fnt "Segoe UI"       11 $reg
+$FONT_SUBTITLE = Fnt "Segoe UI"       13 $reg
 $FONT_BTN   = Fnt "Segoe UI Semibold" 13 $reg
 $FONT_WINBTN = Fnt "Segoe UI"         15 $reg
 # Segoe UI Symbol renders the recycling glyph monochrome (no color-emoji fallback).
@@ -246,7 +246,7 @@ $CARD_H      = 122
 $CARD_MARGIN = 7
 $FLOW_PAD    = 6
 $HEADER_H    = 46
-$SUBBAR_H    = 24     # "Select account" subtitle strip above the cards
+$SUBBAR_H    = 28     # "Select account" subtitle strip above the cards
 $BAR_H       = 6      # thinner bars
 
 # Win32 helper so the borderless window can be dragged by its header.

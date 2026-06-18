@@ -844,7 +844,7 @@ function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$
 # load to avoid re-entrancy.
 $btnRefresh.Add_Click({
     if ($script:loading) { return }
-    Swap-Content $flow { $script:accounts = Render } 300 300
+    Swap-Content $flow { $script:accounts = Render } 100 100
 })
 
 $form.Add_Shown({
@@ -884,7 +884,7 @@ $form.Add_Shown({
     #    fade them in. The header does not fade.
     # $splash overlaps the cards inside $content, so snapshot it explicitly for
     # the fade-OUT (DrawToBitmap of $content would grab the cards instead).
-    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 300 300 $splash
+    Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 100 100 $splash
     $script:loading = $false
 })
 

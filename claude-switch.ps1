@@ -363,6 +363,17 @@ function Get-GridWidth {
     return ($COLS * $cardOuterW + 2 * (Px $FLOW_PAD) + (Px 6))
 }
 
+# Height for a $rows-row layout. Used to size the loading window to the SAME
+# height the cards will need, so the common 1-row case has zero window resize
+# when loading finishes — only the content (loading -> cards) crossfades.
+# Mirrors Render's height math exactly.
+function Get-GridHeight([int]$rows) {
+    $cardOuterH = (Px $CARD_H) + 2 * (Px $CARD_MARGIN)
+    $contentH = $rows * $cardOuterH + 2 * (Px $FLOW_PAD)
+    $flowH = $contentH + (Px 6)
+    return ((Px $HEADER_H) + (Px $SUBBAR_H) + $flowH)
+}
+
 # Center the form on the screen it's currently on. Used only at startup so a
 # window the user has dragged elsewhere is never yanked back.
 function Center-Form {
@@ -822,7 +833,9 @@ $form.Add_Shown({
     # loading, so the header and its buttons never reposition when the cards
     # arrive — only the height changes. Center it now and again after loading so
     # the window appears to expand from the center.
-    $loadH = (Px $HEADER_H) + (Px 150)
+    # One-row height: with 1-2 accounts (the common case) this equals the final
+    # height, so Render's resize is a no-op and only the content crossfades.
+    $loadH = Get-GridHeight 1
     $form.ClientSize = New-Object System.Drawing.Size((Get-GridWidth), $loadH)
     Position-HeaderButtons $form.ClientSize.Width
     Center-Form

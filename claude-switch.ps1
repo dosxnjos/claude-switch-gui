@@ -196,6 +196,7 @@ $cAccent  = [System.Drawing.Color]::FromArgb(224, 130, 95)   # claude-ish terrac
 $cText    = [System.Drawing.Color]::FromArgb(245, 245, 247)
 $cMuted   = [System.Drawing.Color]::FromArgb(184, 186, 198)   # brighter for legibility
 $cTrack   = [System.Drawing.Color]::FromArgb(70, 70, 78)
+$cSubtle  = [System.Drawing.Color]::FromArgb(150, 152, 164)   # subtitle: slightly grayer than $cMuted
 
 $reg  = [System.Drawing.FontStyle]::Regular
 $bold = [System.Drawing.FontStyle]::Bold
@@ -204,6 +205,7 @@ $FONT_ORG   = Fnt "Segoe UI"          12 $reg
 $FONT_USAGE = Fnt "Segoe UI"          12 $reg
 $FONT_NUM   = Fnt "Segoe UI Semibold" 13 $reg
 $FONT_TITLE = Fnt "Segoe UI Semibold" 17 $reg
+$FONT_SUBTITLE = Fnt "Segoe UI"       11 $reg
 $FONT_BTN   = Fnt "Segoe UI Semibold" 13 $reg
 $FONT_WINBTN = Fnt "Segoe UI"         15 $reg
 # Segoe UI Symbol renders the recycling glyph monochrome (no color-emoji fallback).
@@ -231,6 +233,7 @@ $CARD_H      = 122
 $CARD_MARGIN = 7
 $FLOW_PAD    = 6
 $HEADER_H    = 46
+$SUBBAR_H    = 24     # "Select account" subtitle strip above the cards
 $BAR_H       = 6      # thinner bars
 
 # Win32 helper so the borderless window can be dragged by its header.
@@ -257,6 +260,8 @@ $form.ForeColor = $cText
 $form.Font = $FONT_USAGE
 $form.KeyPreview = $true
 $form.ClientSize = Sz 470 200
+# Start fully transparent so the window can fade in once shown.
+$form.Opacity = 0
 if (Test-Path $script:iconPath) {
     try { $form.Icon = New-Object System.Drawing.Icon($script:iconPath) } catch {}
 }
@@ -284,7 +289,7 @@ $dragDown = {
 $header.Add_MouseDown($dragDown)
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "Select account"
+$lblTitle.Text = $form.Text   # project name (e.g. "Claude Switch")
 $lblTitle.Font = $FONT_TITLE
 $lblTitle.ForeColor = $cText
 $lblTitle.AutoSize = $true
@@ -338,6 +343,22 @@ $flow.WrapContents = $true
 $flow.AutoScroll = $true
 $flow.BackColor = $cBg
 $flow.Padding = New-Object System.Windows.Forms.Padding((Px $FLOW_PAD))
+# "Select account" subtitle: smaller, slightly grayer, centered just above the
+# cards. Hidden during loading; revealed (faded in) together with the cards.
+$subBar = New-Object System.Windows.Forms.Panel
+$subBar.Dock = "Top"
+$subBar.Height = Px $SUBBAR_H
+$subBar.BackColor = $cBg
+$subBar.Visible = $false
+$subLbl = New-Object System.Windows.Forms.Label
+$subLbl.Dock = "Fill"
+$subLbl.TextAlign = "MiddleCenter"
+$subLbl.Text = "Select account"
+$subLbl.Font = $FONT_SUBTITLE
+$subLbl.ForeColor = $cSubtle
+$subBar.Controls.Add($subLbl)
+$form.Controls.Add($subBar)
+
 $form.Controls.Add($flow)
 $flow.BringToFront()
 
@@ -611,7 +632,9 @@ function Render {
     $sbW = if ($needScroll) { [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth } else { 0 }
     $clientW = $contentW + $sbW + $slack
     $flowH = if ($needScroll) { $maxFlowH } else { $contentH + $slack }
-    $form.ClientSize = New-Object System.Drawing.Size($clientW, ((Px $HEADER_H) + $flowH))
+    # Always reserve the subtitle strip's height so the layout doesn't jump when
+    # it's revealed after loading.
+    $form.ClientSize = New-Object System.Drawing.Size($clientW, ((Px $HEADER_H) + (Px $SUBBAR_H) + $flowH))
     Position-HeaderButtons $clientW
     $form.Invalidate()
 
@@ -625,19 +648,47 @@ $script:accounts = $null
 
 $btnRefresh.Add_Click({ $script:accounts = Render })
 
+# Animate $form.Opacity from $from to $to over ~$ms milliseconds. Runs on the UI
+# thread (DoEvents keeps it responsive); used for the open fade-in and the
+# loading -> cards crossfade.
+function Fade-Form([double]$from, [double]$to, [int]$ms) {
+    $steps = 10
+    $dt = [int][math]::Max(1, $ms / $steps)
+    $delta = ($to - $from) / $steps
+    $o = $from
+    try { $form.Opacity = [math]::Max(0.0, [math]::Min(1.0, $o)) } catch {}
+    for ($i = 0; $i -lt $steps; $i++) {
+        $o += $delta
+        try { $form.Opacity = [math]::Max(0.0, [math]::Min(1.0, $o)) } catch {}
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds $dt
+    }
+    try { $form.Opacity = $to } catch {}
+}
+
 $form.Add_Shown({
-    # Make sure the splash is laid out and actually painted before the blocking
-    # cswap call, so the window never shows as a half-drawn gray box.
+    # Lay out and paint the loading splash before the blocking cswap call, so the
+    # window never shows as a half-drawn gray box.
     $splash.Visible = $true
     $splash.BringToFront()
     & $layoutSplash
     $form.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
 
+    # 1) Fade the whole window in, with the loading splash showing.
+    Fade-Form 0.0 1.0 160
+
+    # 2) Load accounts (blocking) while the splash is up.
     $script:accounts = Render
 
+    # 3) Crossfade: fade the loading out (.1s), swap to the cards, fade in (.1s).
+    Fade-Form 1.0 0.0 100
     $splash.Visible = $false
+    $subBar.Visible = $true
     $flow.BringToFront()
+    $form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+    Fade-Form 0.0 1.0 100
 })
 
 # number keys 1..9 switch; Esc closes

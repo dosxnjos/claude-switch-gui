@@ -26,7 +26,12 @@ try { [Dpi]::Enable() } catch {}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-function Invoke-Cswap([string[]]$Arguments) {
+# Runs `cswap <args>` and returns its combined stdout+stderr split into lines.
+# With -Pump, the WinForms message loop keeps running while we wait, so the
+# window stays responsive (the close/minimize buttons work, and a slow or
+# hanging cswap can still be dismissed). cswap --list output is small, so
+# reading it after exit can't deadlock the pipe.
+function Invoke-Cswap([string[]]$Arguments, [switch]$Pump) {
     $psi = [System.Diagnostics.ProcessStartInfo]::new("cswap", ($Arguments -join " "))
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
@@ -35,6 +40,13 @@ function Invoke-Cswap([string[]]$Arguments) {
     $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
     $psi.CreateNoWindow = $true
     $p = [System.Diagnostics.Process]::Start($psi)
+    if ($Pump) {
+        while (-not $p.HasExited) {
+            [System.Windows.Forms.Application]::DoEvents()
+            if ($script:closing) { try { $p.Kill() } catch {}; break }
+            Start-Sleep -Milliseconds 25
+        }
+    }
     $out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
     $p.WaitForExit()
     return $out -split "`r?`n"
@@ -110,9 +122,10 @@ function Show-Toast([string]$title, [string]$message, [int]$duration) {
     return Show-LegacyToast $title $message $duration
 }
 
-# Parse `cswap --list` into a list of account objects.
-function Get-Accounts {
-    $lines = Invoke-Cswap "--list"
+# Parse `cswap --list` into a list of account objects. With -Pump the UI stays
+# responsive while cswap runs (see Invoke-Cswap).
+function Get-Accounts([switch]$Pump) {
+    $lines = Invoke-Cswap "--list" -Pump:$Pump
     $accounts = @()
     $current = $null
 
@@ -265,6 +278,12 @@ $form.Opacity = 0
 if (Test-Path $script:iconPath) {
     try { $form.Icon = New-Object System.Drawing.Icon($script:iconPath) } catch {}
 }
+
+# State flags. $closing lets a slow cswap call bail when the user closes the
+# window mid-load; $loading suppresses refresh while the initial load runs.
+$script:closing = $false
+$script:loading = $false
+$form.Add_FormClosing({ $script:closing = $true })
 # Subtle 1px border since there is no title bar / system frame.
 $form.Add_Paint({
     param($s, $e)
@@ -333,6 +352,24 @@ function Position-HeaderButtons($clientW) {
     $btnClose.Location   = New-Object System.Drawing.Point($xClose, $yb)
     $btnMin.Location     = New-Object System.Drawing.Point($xMin,   $yb)
     $btnRefresh.Location = New-Object System.Drawing.Point($xRef,   $yb)
+}
+
+# The card grid is always $COLS columns wide, so the final window width is known
+# before the (slow) account load. Sizing the window to it up front means the
+# header + buttons never reposition when the cards arrive. (Matches Render's
+# no-scroll width; the rare scrollbar case widens it by one scrollbar afterward.)
+function Get-GridWidth {
+    $cardOuterW = (Px $CARD_W) + 2 * (Px $CARD_MARGIN)
+    return ($COLS * $cardOuterW + 2 * (Px $FLOW_PAD) + (Px 6))
+}
+
+# Center the form on the screen it's currently on. Used only at startup so a
+# window the user has dragged elsewhere is never yanked back.
+function Center-Form {
+    $wa = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
+    $x = $wa.X + [int](($wa.Width  - $form.Width)  / 2)
+    $y = $wa.Y + [int](($wa.Height - $form.Height) / 2)
+    $form.Location = New-Object System.Drawing.Point($x, $y)
 }
 
 # Content area below the header. Everything that fades during a transition
@@ -510,9 +547,11 @@ function Add-UsageRow($card, $label, $pct, $reset, $y, $cardW) {
     return ($y + 30)
 }
 
-function Render {
+function Render([switch]$Pump) {
+    $accounts = Get-Accounts -Pump:$Pump
+    # The user may have closed the window while cswap was running.
+    if ($form.IsDisposed -or $script:closing) { return @() }
     $flow.Controls.Clear()
-    $accounts = Get-Accounts
     $cardW = $CARD_W
 
     foreach ($acc in $accounts) {
@@ -769,14 +808,28 @@ function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$
 }
 
 # Refresh: fade only the cards ($flow) out and the freshly-fetched ones in. The
-# header and the "Select account" subtitle stay put.
+# header and the "Select account" subtitle stay put. Ignored during the initial
+# load to avoid re-entrancy.
 $btnRefresh.Add_Click({
+    if ($script:loading) { return }
     Swap-Content $flow { $script:accounts = Render } 100 100
 })
 
 $form.Add_Shown({
-    # Lay out and paint the loading splash before the blocking cswap call, so the
-    # window never shows as a half-drawn gray box.
+    $script:loading = $true
+
+    # Size the window to its FINAL width (the grid is always $COLS columns) before
+    # loading, so the header and its buttons never reposition when the cards
+    # arrive — only the height changes. Center it now and again after loading so
+    # the window appears to expand from the center.
+    $loadH = (Px $HEADER_H) + (Px 150)
+    $form.ClientSize = New-Object System.Drawing.Size((Get-GridWidth), $loadH)
+    Position-HeaderButtons $form.ClientSize.Width
+    Center-Form
+
+    # Lay out and paint the loading splash before the cswap call, so the window
+    # never shows as a half-drawn gray box. The close/minimize buttons are live
+    # the whole time (Render -Pump keeps the message loop running).
     $splash.Visible = $true
     $splash.BringToFront()
     & $layoutSplash
@@ -787,13 +840,16 @@ $form.Add_Shown({
     #    the loading splash showing.
     Fade-Form 0.0 1.0 160
 
-    # 2) Load accounts (blocking) while the splash is up. This also resizes the
-    #    window to fit the cards (the splash covers them being built).
-    $script:accounts = Render
+    # 2) Load accounts while the splash is up. -Pump keeps the UI responsive so a
+    #    slow/failed cswap can still be dismissed. This sets the final height.
+    $script:accounts = Render -Pump
+    if ($form.IsDisposed -or $script:closing) { return }
+    Center-Form
 
     # 3) Content-only crossfade: fade the loading out, reveal subtitle + cards,
     #    fade them in. The header does not fade.
     Swap-Content $content { $splash.Visible = $false; $subBar.Visible = $true; $flow.BringToFront() } 100 100
+    $script:loading = $false
 })
 
 # number keys 1..9 switch; Esc closes

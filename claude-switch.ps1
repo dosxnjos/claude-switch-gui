@@ -6,6 +6,11 @@ Add-Type -AssemblyName System.Drawing
 
 # Declare per-monitor DPI awareness BEFORE any window is created so WinForms
 # renders crisp text instead of being bitmap-stretched (blurry) by Windows.
+# Wrapped in try/catch so a compile failure on a locked-down host degrades
+# gracefully (no DPI awareness) instead of aborting the whole script. (-ErrorAction
+# does not suppress a C# compile error — that's a terminating error — so a real
+# guard is needed here, not the flag.)
+try {
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -20,7 +25,8 @@ public static class Dpi {
         try { SetProcessDPIAware(); } catch {}                                        // SYSTEM
     }
 }
-"@ -ErrorAction SilentlyContinue
+"@
+} catch {}
 try { [Dpi]::Enable() } catch {}
 
 # ---------------------------------------------------------------------------
@@ -31,15 +37,43 @@ try { [Dpi]::Enable() } catch {}
 # window stays responsive (the close/minimize buttons work, and a slow or
 # hanging cswap can still be dismissed). cswap --list output is small, so
 # reading it after exit can't deadlock the pipe.
+# Quote a single argument for a .NET Framework (PS 5.1 / ps2exe) command line.
+# ProcessStartInfo.ArgumentList isn't available there, so we build the command
+# string ourselves and quote any token containing whitespace or a double quote.
+function Quote-Arg([string]$a) {
+    if ($a -notmatch '[\s"]') { return $a }
+    return '"' + ($a -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}
+
 function Invoke-Cswap([string[]]$Arguments, [switch]$Pump) {
-    $psi = [System.Diagnostics.ProcessStartInfo]::new("cswap", ($Arguments -join " "))
-    $psi.UseShellExecute = $false
+    $argStr = ($Arguments | ForEach-Object { Quote-Arg "$_" }) -join " "
+    $psi = [System.Diagnostics.ProcessStartInfo]::new("cswap", $argStr)
+    $psi.UseShellExecute = $false   # also required before touching EnvironmentVariables
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
     $psi.CreateNoWindow = $true
-    $p = [System.Diagnostics.Process]::Start($psi)
+    # cswap prints box-drawing glyphs (├ └ ●). Force UTF-8 on the CHILD (scoped to
+    # this subprocess, not the whole GUI process) so it doesn't crash with a cp1252
+    # UnicodeEncodeError mid-list. NO_COLOR keeps the output ANSI-free regardless of
+    # the user's environment, so the parser never sees escape codes.
+    $psi.EnvironmentVariables["PYTHONUTF8"]       = "1"
+    $psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+    $psi.EnvironmentVariables["NO_COLOR"]         = "1"
+    $psi.EnvironmentVariables.Remove("FORCE_COLOR") | Out-Null
+
+    $script:cswapFailed = $false
+    $script:lastCswapExit = $null
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        # The single most likely real failure: cswap not installed / not on PATH.
+        # Flag it so the caller can render an actionable message instead of hanging.
+        $script:cswapFailed = $true
+        $script:lastCswapExit = -1
+        return @()
+    }
     if ($Pump) {
         while (-not $p.HasExited) {
             [System.Windows.Forms.Application]::DoEvents()
@@ -47,8 +81,18 @@ function Invoke-Cswap([string[]]$Arguments, [switch]$Pump) {
             Start-Sleep -Milliseconds 25
         }
     }
-    $out = $p.StandardOutput.ReadToEnd() + $p.StandardError.ReadToEnd()
-    $p.WaitForExit()
+    # Read stderr asynchronously so a child that fills one pipe while we drain the
+    # other can't deadlock the (otherwise sequential) ReadToEnd pair. Guarded
+    # because the close/kill path above may have already torn the process down.
+    $out = ""
+    try {
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $out = $p.StandardOutput.ReadToEnd()
+        $p.WaitForExit()
+        $out += $errTask.GetAwaiter().GetResult()
+        $script:lastCswapExit = $p.ExitCode
+    } catch {}
+    try { $p.Dispose() } catch {}
     return $out -split "`r?`n"
 }
 
@@ -72,7 +116,11 @@ function Show-ModernToast([string]$title, [string]$message) {
         $imgXml = ""
         if ($script:toastPng -and (Test-Path $script:toastPng)) {
             $uri = ([System.Uri]$script:toastPng).AbsoluteUri
-            $imgXml = "<image placement='appLogoOverride' hint-crop='circle' src='$uri'/>"
+            # Escape for ATTRIBUTE context: a path with an apostrophe (legal in a
+            # Windows username, e.g. C:\Users\O'Brien) would otherwise close the
+            # single-quoted attribute early and make LoadXml throw — killing the toast.
+            $uriAttr = (ConvertTo-XmlText $uri).Replace("'", '&apos;')
+            $imgXml = "<image placement='appLogoOverride' hint-crop='circle' src='$uriAttr'/>"
         }
 
         $xml = @"
@@ -111,7 +159,9 @@ function Show-LegacyToast([string]$title, [string]$message, [int]$duration) {
     $n.Visible = $true
     # ToolTipIcon.None so Windows shows the app icon instead of the blue info glyph.
     $n.ShowBalloonTip($duration, $title, $message, [System.Windows.Forms.ToolTipIcon]::None)
-    return $n
+    # Return the Icon too so the caller can free its HICON: NotifyIcon.Dispose()
+    # does NOT dispose an externally-assigned Icon.
+    return [pscustomobject]@{ NotifyIcon = $n; Icon = $icon }
 }
 
 # Shows a notification, preferring the modern toast (big left icon) and falling
@@ -122,11 +172,22 @@ function Show-Toast([string]$title, [string]$message, [int]$duration) {
     return Show-LegacyToast $title $message $duration
 }
 
+# Dispose whatever Show-Toast returned: $null (modern toast — nothing to free) or
+# the { NotifyIcon; Icon } pair from the legacy balloon (frees the tray icon and
+# the loaded Icon's HICON, but never the shared SystemIcons fallback).
+function Dispose-Toast($toast) {
+    if ($null -eq $toast) { return }
+    try { $toast.NotifyIcon.Dispose() } catch {}
+    if ($toast.Icon -and $toast.Icon -ne [System.Drawing.SystemIcons]::Information) {
+        try { $toast.Icon.Dispose() } catch {}
+    }
+}
+
 # Parse `cswap --list` into a list of account objects. With -Pump the UI stays
 # responsive while cswap runs (see Invoke-Cswap).
 function Get-Accounts([switch]$Pump) {
     $lines = Invoke-Cswap "--list" -Pump:$Pump
-    $accounts = @()
+    $accounts = [System.Collections.Generic.List[object]]::new()
     $current = $null
 
     foreach ($raw in $lines) {
@@ -134,7 +195,7 @@ function Get-Accounts([switch]$Pump) {
 
         # Account header line:  "  1: email [Org] (active)"
         if ($line -match '^\s*(\d+):\s*(.*?)\s*\[(.*?)\]\s*(\(active\))?\s*$') {
-            if ($null -ne $current) { $accounts += $current }
+            if ($null -ne $current) { $accounts.Add($current) }
             $current = [pscustomobject]@{
                 Num    = [int]$matches[1]
                 Email  = $matches[2].Trim()
@@ -165,8 +226,10 @@ function Get-Accounts([switch]$Pump) {
             $current.Unavailable = $true
         }
     }
-    if ($null -ne $current) { $accounts += $current }
-    return $accounts
+    if ($null -ne $current) { $accounts.Add($current) }
+    # Wrap in a unary array so a single-account result isn't unwrapped to a scalar
+    # on return (keeps .Count / foreach behaving for callers).
+    return ,$accounts
 }
 
 # Color for a usage percentage: green (low) -> amber -> red (near limit).
@@ -250,6 +313,7 @@ $SUBBAR_H    = 28     # "Select account" subtitle strip above the cards
 $BAR_H       = 6      # thinner bars
 
 # Win32 helper so the borderless window can be dragged by its header.
+try {
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -257,7 +321,8 @@ public static class Drag {
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int msg, int wp, int lp);
 }
-"@ -ErrorAction SilentlyContinue
+"@
+} catch {}
 
 # ---------------------------------------------------------------------------
 # Form
@@ -283,6 +348,8 @@ if (Test-Path $script:iconPath) {
 # window mid-load; $loading suppresses refresh while the initial load runs.
 $script:closing = $false
 $script:loading = $false
+$script:cswapFailed = $false      # set by Invoke-Cswap when cswap can't be started
+$script:lastCswapExit = $null     # exit code of the last cswap call (for switch confirmation)
 $form.Add_FormClosing({ $script:closing = $true })
 # Subtle 1px border since there is no title bar / system frame.
 $form.Add_Paint({
@@ -488,21 +555,35 @@ function Switch-To($account) {
     if ($script:switching) { return }
     $script:switching = $true
 
-    Invoke-Cswap @("--switch-to", $account.Num) | Out-Null
-    Start-Sleep -Milliseconds 800
+    # Run the switch with -Pump so the UI thread keeps its message loop alive (no
+    # frozen window / dead buttons while cswap runs).
+    Invoke-Cswap @("--switch-to", $account.Num) -Pump | Out-Null
 
-    # Confirm with fresh usage info, then hold briefly so the toast can show.
-    $fresh = Get-Accounts
-    $now = $fresh | Where-Object { $_.Active } | Select-Object -First 1
-    $form.Hide()
-    if ($null -ne $now) {
-        $u = if ($now.Unavailable) { "usage unavailable" }
-             else { "5h: $($now.Pct5h)%   7d: $($now.Pct7d)%" }
-        $toast = Show-Toast "Account switched" "$($now.Email)`n$u" 5000
-        Start-Sleep -Seconds 4
-        if ($null -ne $toast) { $toast.Dispose() }
+    # cswap exits non-zero on failure (verified), so the exit code is a reliable
+    # success signal — no need for a second confirmatory `--list`.
+    if ($script:lastCswapExit -ne 0) {
+        Show-Toast "Switch failed" "$($account.Email)`ncswap exited with code $($script:lastCswapExit)" 5000 | Out-Null
+        $script:switching = $false
+        return
     }
-    $form.Close()
+
+    # Build the toast from the account already in hand: its email is exact and its
+    # usage is at most seconds stale — far cheaper than re-spawning `cswap --list`.
+    $form.Hide()
+    $u = if ($account.Unavailable) { "usage unavailable" }
+         else { "5h: $($account.Pct5h)%   7d: $($account.Pct7d)%" }
+    $toast = Show-Toast "Account switched" "$($account.Email)`n$u" 5000
+
+    # Hold long enough for the toast to be seen WITHOUT blocking: a one-shot Timer
+    # (fires on the ShowDialog message loop) disposes the toast and closes the form.
+    $t = New-Object System.Windows.Forms.Timer
+    $t.Interval = 4000
+    $t.Add_Tick({
+        $t.Stop(); $t.Dispose()
+        Dispose-Toast $toast
+        $form.Close()
+    }.GetNewClosure())
+    $t.Start()
 }
 
 # Adds one usage row to a card: "5h" label + thin bar + pct on one line, the
@@ -566,6 +647,12 @@ function Render([switch]$Pump) {
     $accounts = Get-Accounts -Pump:$Pump
     # The user may have closed the window while cswap was running.
     if ($form.IsDisposed -or $script:closing) { return @() }
+    # Suspend layout for the whole rebuild so the FlowLayoutPanel does ONE layout
+    # pass instead of reflowing on every Controls.Add (N^2 thrash otherwise).
+    $flow.SuspendLayout()
+    # Dispose the previous cards (detaching their handlers and tooltip entries)
+    # before clearing — Controls.Clear() only detaches; it does not dispose.
+    foreach ($old in @($flow.Controls)) { $old.Dispose() }
     $flow.Controls.Clear()
     $cardW = $CARD_W
 
@@ -676,10 +763,28 @@ function Render([switch]$Pump) {
         $flow.Controls.Add($card)
     }
 
+    # Empty / failure state: nothing to render — show a short message instead of a
+    # blank window so the user knows what happened (and how to fix it).
+    if ($accounts.Count -eq 0) {
+        $msg = New-Object System.Windows.Forms.Label
+        $msg.Text = if ($script:cswapFailed) {
+            "Could not run cswap.`nInstall it:  uv tool install claude-swap"
+        } else {
+            "No accounts managed by cswap.`nAdd one:  cswap --add-account"
+        }
+        $msg.Font = $FONT_ORG
+        $msg.ForeColor = $cMuted
+        $msg.AutoSize = $true
+        $msg.Location = Pt 16 14
+        $flow.Controls.Add($msg)
+    }
+
+    $flow.ResumeLayout($true)
+
     # Size the window: $COLS columns wide. The flow padding + card margins give a
     # uniform 13px gutter on every side (left/right/top/bottom); no extra slack,
     # so the bottom margin matches the sides and grows by one row at a time.
-    $rows = [math]::Ceiling($accounts.Count / [double]$COLS)
+    $rows = [math]::Max(1, [math]::Ceiling($accounts.Count / [double]$COLS))
     $cardOuterW = (Px $CARD_W) + 2 * (Px $CARD_MARGIN)
     $cardOuterH = (Px $CARD_H) + 2 * (Px $CARD_MARGIN)
     $padPx  = Px $FLOW_PAD
@@ -708,7 +813,7 @@ function Render([switch]$Pump) {
         $flow.Invalidate()
     }
 
-    return $accounts
+    return ,$accounts
 }
 
 # ---------------------------------------------------------------------------
@@ -720,16 +825,17 @@ $script:accounts = $null
 # fade-in of the whole window. Content transitions use Swap-Content (below) so
 # the header doesn't fade with them.
 function Fade-Form([double]$from, [double]$to, [int]$ms) {
-    $steps = 10
-    $dt = [int][math]::Max(1, $ms / $steps)
-    $delta = ($to - $from) / $steps
-    $o = $from
-    try { $form.Opacity = [math]::Max(0.0, [math]::Min(1.0, $o)) } catch {}
-    for ($i = 0; $i -lt $steps; $i++) {
-        $o += $delta
+    # Time-based (like Fade-Overlay): opacity is derived from elapsed time so the
+    # fade lasts ~$ms and renders as many frames as the machine allows, instead of
+    # a fixed step count whose per-frame Sleep overhead overshoots the target.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $form.Opacity = [math]::Max(0.0, [math]::Min(1.0, $from)) } catch {}
+    while ($sw.ElapsedMilliseconds -lt $ms) {
+        $t = $sw.ElapsedMilliseconds / [double]$ms
+        $o = $from + ($to - $from) * $t
         try { $form.Opacity = [math]::Max(0.0, [math]::Min(1.0, $o)) } catch {}
         [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds $dt
+        Start-Sleep -Milliseconds 5
     }
     try { $form.Opacity = $to } catch {}
 }

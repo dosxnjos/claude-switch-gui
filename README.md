@@ -30,49 +30,47 @@ as a card with 5h/7d usage. Clicking a card switches the active account
 | **`cswap` on PATH** | The `claude-swap` CLI. Install with [uv](https://docs.astral.sh/uv/): `uv tool install claude-swap`. The app calls `cswap --list` and `cswap --switch-to`. |
 | **PowerShell** | Windows PowerShell 5.1 (ships with Windows) or PowerShell 7. |
 | **`ps2exe` module** | Only to **recompile** the `.exe`. Install with `Install-Module ps2exe`. |
-| **Python + Pillow** | Only to **regenerate the icon** via `make_icon.py` (optional). `pip install pillow`. |
 
-> To just **use** the app you only need Windows + `cswap` installed. `ps2exe` and
-> Python are only required to rebuild the executable or the icon.
+> To just **use** the app you only need Windows + `cswap` installed. `ps2exe` is
+> only required to rebuild the executable.
 
 ## Usage
 
-Double-click **`Claude Switch.exe`** (or `Claude Switch.bat`, which just runs the
-`.ps1` with a hidden PowerShell window).
+Double-click **`Claude Switch.bat`** — it runs the `.ps1` with a hidden PowerShell
+window and works straight from a clone (no build step). Or build/download
+**`Claude Switch.exe`** (see *Recompiling* below) for a single-file double-click
+launcher with the embedded icon.
 
 ## Files
 
 | File | Role |
 |------|------|
 | `claude-switch.ps1` | **Source code** of the window (WinForms in PowerShell). |
-| `Claude Switch.exe` | Executable compiled from the `.ps1` (build artifact). |
+| `build.ps1` | Build script: compiles the `.ps1` to `Claude Switch.exe` via ps2exe. |
+| `Claude Switch.exe` | Executable compiled from the `.ps1`. **Build artifact — not tracked in git**; build it with `build.ps1` or grab it from a Release. |
 | `Claude Switch.bat` | Alternative launcher (runs the `.ps1` with no console). |
 | `claude-switch-full.ico` | App icon (used by the `.exe` and the window). |
 | `claude-switch-full.png` | Same icon as PNG, used by the modern toast (WinRT toasts don't render `.ico` reliably). |
-| `make_icon.py` | Icon generator (draws the `.ico` from scratch with Pillow). |
 
 ## Recompiling the `.exe`
 
-All behavior/visual changes are made in **`claude-switch.ps1`**. Then recompile to
-produce the `.exe`:
+All behavior/visual changes are made in **`claude-switch.ps1`**. Then build the
+`.exe` with the build script:
 
 ```powershell
 # once, if you don't have the module yet:
 Install-Module ps2exe -Scope CurrentUser
 
 # in the project folder:
-Import-Module ps2exe
-Invoke-ps2exe `
-  -inputFile  ".\claude-switch.ps1" `
-  -outputFile ".\Claude Switch.exe" `
-  -iconFile   ".\claude-switch-full.ico" `
-  -noConsole `
-  -title      "Claude Switch" `
-  -description "Multi-account switcher for Claude Code"
+./build.ps1            # compile claude-switch.ps1 -> "Claude Switch.exe"
 ```
 
-- `-noConsole` — no console window (this is a windowed app).
-- `-iconFile` — embeds the icon into the `.exe`.
+`build.ps1` wraps the exact `ps2exe` invocation (`-noConsole` so there's no console
+window, `-iconFile` to embed the icon), so the build is one reproducible command.
+
+> The `.exe` is **not committed** — it's a build artifact. Build it locally, or
+> publish it on a tagged GitHub Release (ideally signed, with a published SHA-256)
+> so users can verify it matches the source.
 
 ### Debugging tip
 
@@ -82,16 +80,6 @@ directly and capture the error:
 ```powershell
 powershell -ExecutionPolicy Bypass -NoProfile -File ".\claude-switch.ps1"
 ```
-
-## Regenerating the icon (optional)
-
-```powershell
-pip install pillow
-python .\make_icon.py
-```
-
-This generates/updates `claude-switch-full.ico`. Recompile the `.exe` afterwards to
-embed the new icon.
 
 ## Implementation notes
 

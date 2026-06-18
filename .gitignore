@@ -3,3 +3,7 @@ debug.log
 shot*.png
 window-shot.png
 *.tmp
+
+# Build artifact: the .exe is reproducible from claude-switch.ps1 via build.ps1.
+# Distribute it via a tagged GitHub Release (signed / with a SHA-256), not in-repo.
+Claude Switch.exe

@@ -47,7 +47,8 @@ Double-click **`Claude Switch.exe`** (or `Claude Switch.bat`, which just runs th
 | `claude-switch.ps1` | **Source code** of the window (WinForms in PowerShell). |
 | `Claude Switch.exe` | Executable compiled from the `.ps1` (build artifact). |
 | `Claude Switch.bat` | Alternative launcher (runs the `.ps1` with no console). |
-| `claude-switch-full.ico` | App icon (used by the `.exe`, the window and the toast). |
+| `claude-switch-full.ico` | App icon (used by the `.exe` and the window). |
+| `claude-switch-full.png` | Same icon as PNG, used by the modern toast (WinRT toasts don't render `.ico` reliably). |
 | `make_icon.py` | Icon generator (draws the `.ico` from scratch with Pillow). |
 
 ## Recompiling the `.exe`

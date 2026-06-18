@@ -40,7 +40,55 @@ function Invoke-Cswap([string[]]$Arguments) {
     return $out -split "`r?`n"
 }
 
-function Show-Toast($title, $message, $duration) {
+function ConvertTo-XmlText([string]$s) {
+    return $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+}
+
+# Modern Windows 10/11 toast: shows the app icon LARGE on the left via
+# appLogoOverride. Returns $true on success, $false if the WinRT toast APIs are
+# unavailable (older Windows) so the caller can fall back to the legacy balloon.
+function Show-ModernToast([string]$title, [string]$message) {
+    try {
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+        [Windows.UI.Notifications.ToastNotification,        Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+        [Windows.Data.Xml.Dom.XmlDocument,                  Windows.Data.Xml.Dom,    ContentType=WindowsRuntime] | Out-Null
+
+        # Each line of $message becomes its own <text> element (they stack).
+        $lines = $message -split "`r?`n"
+        $textXml = ($lines | ForEach-Object { "<text>$(ConvertTo-XmlText $_)</text>" }) -join "`n"
+
+        $imgXml = ""
+        if ($script:toastPng -and (Test-Path $script:toastPng)) {
+            $uri = ([System.Uri]$script:toastPng).AbsoluteUri
+            $imgXml = "<image placement='appLogoOverride' hint-crop='circle' src='$uri'/>"
+        }
+
+        $xml = @"
+<toast>
+  <visual>
+    <binding template='ToastGeneric'>
+      $imgXml
+      <text>$(ConvertTo-XmlText $title)</text>
+      $textXml
+    </binding>
+  </visual>
+</toast>
+"@
+        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $doc.LoadXml($xml)
+        $toast = New-Object Windows.UI.Notifications.ToastNotification($doc)
+        # PowerShell's registered AUMID — present on every Win10/11 box, so no
+        # Start Menu shortcut is required for the toast to appear.
+        $aumid = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($aumid).Show($toast)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# Legacy tray balloon — small icon. Fallback for pre-Win10 only.
+function Show-LegacyToast([string]$title, [string]$message, [int]$duration) {
     $n = New-Object System.Windows.Forms.NotifyIcon
     $icon = $null
     if ($script:iconPath -and (Test-Path $script:iconPath)) {
@@ -52,6 +100,14 @@ function Show-Toast($title, $message, $duration) {
     # ToolTipIcon.None so Windows shows the app icon instead of the blue info glyph.
     $n.ShowBalloonTip($duration, $title, $message, [System.Windows.Forms.ToolTipIcon]::None)
     return $n
+}
+
+# Shows a notification, preferring the modern toast (big left icon) and falling
+# back to the legacy balloon. Returns a NotifyIcon to dispose, or $null when the
+# modern toast handled it (nothing to dispose).
+function Show-Toast([string]$title, [string]$message, [int]$duration) {
+    if (Show-ModernToast $title $message) { return $null }
+    return Show-LegacyToast $title $message $duration
 }
 
 # Parse `cswap --list` into a list of account objects.
@@ -163,6 +219,8 @@ if ([string]::IsNullOrEmpty($baseDir)) {
 }
 if ([string]::IsNullOrEmpty($baseDir)) { $baseDir = (Get-Location).Path }
 $script:iconPath = Join-Path $baseDir "claude-switch-full.ico"
+# PNG sibling for the modern toast (WinRT toasts don't render .ico reliably).
+$script:toastPng = Join-Path $baseDir "claude-switch-full.png"
 
 $cBorder = [System.Drawing.Color]::FromArgb(70, 70, 78)
 
@@ -310,7 +368,7 @@ function Switch-To($account) {
              else { "5h: $($now.Pct5h)%   7d: $($now.Pct7d)%" }
         $toast = Show-Toast "Account switched" "$($now.Email)`n$u" 5000
         Start-Sleep -Seconds 4
-        $toast.Dispose()
+        if ($null -ne $toast) { $toast.Dispose() }
     }
     $form.Close()
 }

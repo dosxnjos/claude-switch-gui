@@ -341,6 +341,57 @@ $flow.Padding = New-Object System.Windows.Forms.Padding((Px $FLOW_PAD))
 $form.Controls.Add($flow)
 $flow.BringToFront()
 
+# ---------------------------------------------------------------------------
+# Loading splash
+# ---------------------------------------------------------------------------
+# `cswap --list` is a blocking subprocess call. Running it on the UI thread
+# (inside Add_Shown) freezes painting, so the window would otherwise appear as a
+# half-drawn gray box until cswap answers. We show this splash — the app icon
+# centered over a "loading" label — and force a paint BEFORE the blocking call.
+
+# Load the PNG into memory (don't lock the file on disk).
+$script:splashImg = $null
+if (Test-Path $script:toastPng) {
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($script:toastPng)
+        $ms = New-Object System.IO.MemoryStream(,$bytes)
+        $script:splashImg = [System.Drawing.Image]::FromStream($ms)
+    } catch {}
+}
+
+$splash = New-Object System.Windows.Forms.Panel
+$splash.Dock = "Fill"
+$splash.BackColor = $cBg
+
+$splashPic = New-Object System.Windows.Forms.PictureBox
+$splashPic.SizeMode = "Zoom"
+$splashPic.Size = Sz 88 88
+$splashPic.BackColor = [System.Drawing.Color]::Transparent
+if ($null -ne $script:splashImg) { $splashPic.Image = $script:splashImg }
+$splash.Controls.Add($splashPic)
+
+$splashLbl = New-Object System.Windows.Forms.Label
+$splashLbl.Text = "Carregando contas…"
+$splashLbl.Font = $FONT_ORG
+$splashLbl.ForeColor = $cMuted
+$splashLbl.AutoSize = $true
+$splash.Controls.Add($splashLbl)
+
+# Center the icon + label whenever the splash is sized.
+$layoutSplash = {
+    $w = $splash.ClientSize.Width
+    $h = $splash.ClientSize.Height
+    $gap = Px 12
+    $blockH = $splashPic.Height + $gap + $splashLbl.Height
+    $top = [int](($h - $blockH) / 2)
+    $splashPic.Location = New-Object System.Drawing.Point([int](($w - $splashPic.Width) / 2), $top)
+    $splashLbl.Location = New-Object System.Drawing.Point([int](($w - $splashLbl.Width) / 2), ($splashPic.Bottom + $gap))
+}.GetNewClosure()
+$splash.Add_Resize($layoutSplash)
+
+$form.Controls.Add($splash)
+$splash.BringToFront()
+
 # Tooltip so the full email/org is available even when the card clips it.
 $tip = New-Object System.Windows.Forms.ToolTip
 $tip.InitialDelay = 400
@@ -574,7 +625,20 @@ $script:accounts = $null
 
 $btnRefresh.Add_Click({ $script:accounts = Render })
 
-$form.Add_Shown({ $script:accounts = Render })
+$form.Add_Shown({
+    # Make sure the splash is laid out and actually painted before the blocking
+    # cswap call, so the window never shows as a half-drawn gray box.
+    $splash.Visible = $true
+    $splash.BringToFront()
+    & $layoutSplash
+    $form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
+
+    $script:accounts = Render
+
+    $splash.Visible = $false
+    $flow.BringToFront()
+})
 
 # number keys 1..9 switch; Esc closes
 $form.Add_KeyDown({

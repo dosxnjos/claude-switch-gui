@@ -389,6 +389,11 @@ $content = New-Object System.Windows.Forms.Panel
 $content.Dock = "Fill"
 $content.BackColor = $cBg
 $form.Controls.Add($content)
+# Dock fill must be brought to front so it fills the area BELOW the (Top-docked)
+# header instead of the whole form. Without this, $content covers the header and
+# the crossfade overlay (sized to $content) hides it, making the header seem to
+# "reappear" after the cards.
+$content.BringToFront()
 
 # Scrollable flow container: cards sit side by side and wrap to new rows.
 $flow = New-Object System.Windows.Forms.FlowLayoutPanel

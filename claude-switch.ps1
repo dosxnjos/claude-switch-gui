@@ -734,27 +734,6 @@ function Fade-Form([double]$from, [double]$to, [int]$ms) {
     try { $form.Opacity = $to } catch {}
 }
 
-# Returns a $w x $h bitmap: the background with $img drawn over it at $alpha
-# (0..1). WinForms controls have no per-control opacity, so we fake it by
-# alpha-blending a snapshot via a ColorMatrix.
-function Compose-Faded($img, [double]$alpha, [int]$w, [int]$h) {
-    $bmp = New-Object System.Drawing.Bitmap($w, $h)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    try {
-        $g.Clear($cBg)
-        if ($null -ne $img -and $alpha -gt 0) {
-            $cm = New-Object System.Drawing.Imaging.ColorMatrix
-            $cm.Matrix33 = [single][math]::Min(1.0, $alpha)
-            $ia = New-Object System.Drawing.Imaging.ImageAttributes
-            $ia.SetColorMatrix($cm)
-            $rect = New-Object System.Drawing.Rectangle(0, 0, $w, $h)
-            $g.DrawImage($img, $rect, 0, 0, $img.Width, $img.Height, [System.Drawing.GraphicsUnit]::Pixel, $ia)
-            $ia.Dispose()
-        }
-    } finally { $g.Dispose() }
-    return $bmp
-}
-
 # Snapshot a control's current pixels into a bitmap.
 function Snapshot-Of($ctl) {
     $w = $ctl.ClientSize.Width; $h = $ctl.ClientSize.Height
@@ -764,29 +743,31 @@ function Snapshot-Of($ctl) {
     return $bmp
 }
 
-# Current frame painted by the overlay panel (see Swap-Content). We use a Panel
-# with a custom Paint handler rather than a PictureBox: PictureBox runs the
-# ImageAnimator on show, which throws on bitmaps produced by DrawToBitmap.
+# The overlay panel draws $script:ovImg at $script:ovAlpha (see Swap-Content's
+# Paint handler). We keep the source bitmap fixed and vary only the alpha, so
+# each frame is a single alpha-blended DrawImage with NO per-frame bitmap
+# allocation — that's what keeps the fade smooth instead of laggy. (A Panel, not
+# a PictureBox: PictureBox runs the ImageAnimator on show, which throws on
+# bitmaps produced by DrawToBitmap.)
 $script:ovImg = $null
+$script:ovAlpha = 1.0
 
-# Animate the overlay from $img@$from to $img@$to over $ms ms.
+# Animate $img from $from to $to opacity over $ms ms. Time-based (alpha derived
+# from elapsed time) so the fade lasts exactly $ms and renders as many frames as
+# the machine can — instead of a fixed step count whose per-frame Sleep overhead
+# stretches the total well past the target (what made it feel laggy).
 function Fade-Overlay($overlay, $img, [double]$from, [double]$to, [int]$ms) {
-    # ~60fps: one step per ~16ms, at least 8 steps.
-    $steps = [math]::Max(8, [int]($ms / 16))
-    $dt = [int][math]::Max(1, $ms / $steps)
-    $delta = ($to - $from) / $steps
-    $a = $from
-    $prev = $null
-    for ($i = 0; $i -lt $steps; $i++) {
-        $a += $delta
-        $frame = Compose-Faded $img $a $overlay.Width $overlay.Height
-        $script:ovImg = $frame
+    $script:ovImg = $img
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $ms) {
+        $t = $sw.ElapsedMilliseconds / [double]$ms
+        $script:ovAlpha = [math]::Max(0.0, [math]::Min(1.0, $from + ($to - $from) * $t))
         $overlay.Invalidate(); $overlay.Update()
-        if ($null -ne $prev) { $prev.Dispose() }
-        $prev = $frame
         [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds $dt
+        Start-Sleep -Milliseconds 5
     }
+    $script:ovAlpha = $to
+    $overlay.Invalidate(); $overlay.Update()
 }
 
 # Crossfade just $target (e.g. the whole content area, or only the cards): an
@@ -808,11 +789,23 @@ function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$
     $ov.BackColor = $cBg
     # Double-buffer the overlay so the fade doesn't flicker.
     try { $ov.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic').SetValue($ov, $true, $null) } catch {}
+    # The panel auto-clears to its BackColor ($cBg) each paint; we draw the source
+    # image over it at the current alpha. No bitmap is allocated per frame.
     $ov.Add_Paint({
         param($s, $e)
-        if ($null -ne $script:ovImg) { $e.Graphics.DrawImageUnscaled($script:ovImg, 0, 0) }
+        $img = $script:ovImg
+        if ($null -ne $img -and $script:ovAlpha -gt 0) {
+            $cm = New-Object System.Drawing.Imaging.ColorMatrix
+            $cm.Matrix33 = [single]$script:ovAlpha
+            $ia = New-Object System.Drawing.Imaging.ImageAttributes
+            $ia.SetColorMatrix($cm)
+            $r = New-Object System.Drawing.Rectangle(0, 0, $img.Width, $img.Height)
+            $e.Graphics.DrawImage($img, $r, 0, 0, $img.Width, $img.Height, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+            $ia.Dispose()
+        }
     })
     $script:ovImg = $bmpOld
+    $script:ovAlpha = 1.0
     $parent.Controls.Add($ov)
     $ov.BringToFront()
     $ov.Invalidate(); $ov.Update()
@@ -834,7 +827,9 @@ function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$
 
     $parent.Controls.Remove($ov)
     $ov.Dispose()
-    if ($null -ne $script:ovImg) { $script:ovImg.Dispose(); $script:ovImg = $null }
+    # $script:ovImg just aliases $bmpOld/$bmpNew now — clear it, don't dispose it
+    # here (the sources are disposed below), to avoid a double-dispose.
+    $script:ovImg = $null
     if ($null -ne $bmpOld) { $bmpOld.Dispose() }
     if ($null -ne $bmpNew) { $bmpNew.Dispose() }
 }

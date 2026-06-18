@@ -360,7 +360,7 @@ function Position-HeaderButtons($clientW) {
 # no-scroll width; the rare scrollbar case widens it by one scrollbar afterward.)
 function Get-GridWidth {
     $cardOuterW = (Px $CARD_W) + 2 * (Px $CARD_MARGIN)
-    return ($COLS * $cardOuterW + 2 * (Px $FLOW_PAD) + (Px 6))
+    return ($COLS * $cardOuterW + 2 * (Px $FLOW_PAD))
 }
 
 # Height for a $rows-row layout. Used to size the loading window to the SAME
@@ -370,8 +370,7 @@ function Get-GridWidth {
 function Get-GridHeight([int]$rows) {
     $cardOuterH = (Px $CARD_H) + 2 * (Px $CARD_MARGIN)
     $contentH = $rows * $cardOuterH + 2 * (Px $FLOW_PAD)
-    $flowH = $contentH + (Px 6)
-    return ((Px $HEADER_H) + (Px $SUBBAR_H) + $flowH)
+    return ((Px $HEADER_H) + (Px $SUBBAR_H) + $contentH)
 }
 
 # Center the form on the screen it's currently on. Used only at startup so a
@@ -672,14 +671,13 @@ function Render([switch]$Pump) {
         $flow.Controls.Add($card)
     }
 
-    # Size the window: $COLS columns wide, scroll vertically past the cap.
-    # Sum the already-scaled component widths (each Px() rounds independently),
-    # then add a few px of slack so a column never wraps from off-by-one.
+    # Size the window: $COLS columns wide. The flow padding + card margins give a
+    # uniform 13px gutter on every side (left/right/top/bottom); no extra slack,
+    # so the bottom margin matches the sides and grows by one row at a time.
     $rows = [math]::Ceiling($accounts.Count / [double]$COLS)
     $cardOuterW = (Px $CARD_W) + 2 * (Px $CARD_MARGIN)
     $cardOuterH = (Px $CARD_H) + 2 * (Px $CARD_MARGIN)
     $padPx  = Px $FLOW_PAD
-    $slack  = Px 6
     $contentW = $COLS * $cardOuterW + 2 * $padPx
     $contentH = $rows * $cardOuterH + 2 * $padPx
     $maxFlowH = Px 640
@@ -688,13 +686,22 @@ function Render([switch]$Pump) {
     # scrollbar width and squeezes a column out.
     $flow.AutoScroll = $needScroll
     $sbW = if ($needScroll) { [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth } else { 0 }
-    $clientW = $contentW + $sbW + $slack
-    $flowH = if ($needScroll) { $maxFlowH } else { $contentH + $slack }
+    $clientW = $contentW + $sbW
+    $flowH = if ($needScroll) { $maxFlowH } else { $contentH }
     # Always reserve the subtitle strip's height so the layout doesn't jump when
     # it's revealed after loading.
-    $form.ClientSize = New-Object System.Drawing.Size($clientW, ((Px $HEADER_H) + (Px $SUBBAR_H) + $flowH))
-    Position-HeaderButtons $clientW
-    $form.Invalidate()
+    $newH = (Px $HEADER_H) + (Px $SUBBAR_H) + $flowH
+
+    # Repaint the whole form (header + border) ONLY when the size actually changes
+    # — otherwise just the cards, so the header never flickers on a same-size
+    # (re)load, matching the reload behavior.
+    if ($form.ClientSize.Width -ne $clientW -or $form.ClientSize.Height -ne $newH) {
+        $form.ClientSize = New-Object System.Drawing.Size($clientW, $newH)
+        Position-HeaderButtons $clientW
+        $form.Invalidate()
+    } else {
+        $flow.Invalidate()
+    }
 
     return $accounts
 }
@@ -803,7 +810,10 @@ function Swap-Content($target, [scriptblock]$buildNew, [int]$msOut = 100, [int]$
     Fade-Overlay $ov $bmpOld 1.0 0.0 $msOut
 
     & $buildNew
-    $form.Refresh()
+    # Lay out only the swapped area (not the whole form) so the header isn't
+    # repainted. The overlay still covers $target, and Snapshot-Of below renders
+    # via DrawToBitmap, so no on-screen refresh of $target is needed here.
+    try { $target.PerformLayout() } catch {}
     [System.Windows.Forms.Application]::DoEvents()
 
     # $buildNew may have resized things; re-fit the overlay over the target.

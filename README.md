@@ -1,10 +1,12 @@
 # Claude Switch GUI
 
 A Windows GUI to switch **Claude Code** accounts with a single click.
-It is a visual shell on top of the [`claude-swap`](https://pypi.org/project/claude-swap/)
-CLI (the `cswap` command): on launch it reads `cswap --list` and shows each account
-as a card with 5h/7d usage. Clicking a card switches the active account
-(`cswap --switch-to N`).
+On launch it reads the accounts and their 5h/7d usage **natively** — straight from
+the on-disk [`claude-swap`](https://pypi.org/project/claude-swap/) data
+(`sequence.json` + the per-account credential files) and the Anthropic usage API —
+so no `cswap` subprocess is spawned just to draw the cards (it falls back to parsing
+`cswap --list` if that data layout isn't recognized). Clicking a card switches the
+active account via `cswap --switch-to N`.
 
 ![preview](docs/screenshot.png)
 
@@ -27,7 +29,7 @@ as a card with 5h/7d usage. Clicking a card switches the active account
 | Requirement | Detail |
 |-------------|--------|
 | **Windows** | 10/11 (uses WinForms + the `Segoe MDL2 Assets` / `Segoe UI Symbol` fonts). |
-| **`cswap` on PATH** | The `claude-swap` CLI. Install with [uv](https://docs.astral.sh/uv/): `uv tool install claude-swap`. The app calls `cswap --list` and `cswap --switch-to`. |
+| **`cswap` on PATH** | The `claude-swap` CLI. Install with [uv](https://docs.astral.sh/uv/): `uv tool install claude-swap`. Used to **switch** accounts (`cswap --switch-to`) and to set up accounts in the first place; listing + usage are read natively, with `cswap --list` as a fallback. |
 | **PowerShell** | Windows PowerShell 5.1 (ships with Windows) or PowerShell 7. |
 | **`ps2exe` module** | Only to **recompile** the `.exe`. Install with `Install-Module ps2exe`. |
 

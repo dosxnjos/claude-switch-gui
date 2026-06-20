@@ -29,6 +29,10 @@ public static class Dpi {
 } catch {}
 try { [Dpi]::Enable() } catch {}
 
+# Force TLS 1.2 for the usage API calls the native reader makes (PS 5.1 defaults
+# to SSL3/TLS1.0 on some hosts, which Anthropic's endpoints reject).
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -183,9 +187,189 @@ function Dispose-Toast($toast) {
     }
 }
 
-# Parse `cswap --list` into a list of account objects. With -Pump the UI stays
-# responsive while cswap runs (see Invoke-Cswap).
+# Local-time clock for a usage reset timestamp, mirroring cswap's format_reset:
+# "HH:mm" when it resets today, else "MMM d HH:mm" (e.g. "Jun 23 01:00"). Empty
+# string when there's no reset time (the card then omits the reset line).
+function Format-ResetClock($iso) {
+    if ([string]::IsNullOrWhiteSpace("$iso")) { return "" }
+    try {
+        $dt  = [datetimeoffset]::Parse("$iso").ToLocalTime()
+        $now = [datetimeoffset]::Now
+        if ($dt.Date -eq $now.Date) { return $dt.ToString("HH:mm") }
+        return $dt.ToString("MMM d HH:mm", [Globalization.CultureInfo]::InvariantCulture)
+    } catch { return "" }
+}
+
+# Fetch the Anthropic usage API for many access tokens concurrently (mirrors
+# cswap's ThreadPoolExecutor fetch). Uses a runspace pool + bare HttpWebRequest
+# (no cmdlet modules needed in the child runspaces), and with -Pump keeps the UI
+# message loop alive while the calls are in flight so the window stays responsive
+# and a close mid-load still works. Returns raw JSON strings (or $null), input
+# order. NEVER refreshes a token: a refreshed (rotated, single-use) refresh token
+# would have to be written back to disk — that's cswap's job, not the GUI's.
+function Fetch-UsageConcurrent($tokens, [switch]$Pump) {
+    $sb = {
+        param($token)
+        if (-not $token) { return $null }
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $req = [System.Net.HttpWebRequest]::Create('https://api.anthropic.com/api/oauth/usage')
+            $req.Method = 'GET'; $req.Timeout = 6000; $req.UserAgent = 'claude-swap/1.0'
+            $req.Headers.Add('Authorization', "Bearer $token")
+            $req.Headers.Add('anthropic-beta', 'oauth-2025-04-20')
+            $resp = $req.GetResponse()
+            $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $content = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
+            return [string]$content
+        } catch { return $null }
+    }
+    $max = [Math]::Min(4, [Math]::Max(1, $tokens.Count))
+    $pool = [runspacefactory]::CreateRunspacePool(1, $max); $pool.Open()
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($t in $tokens) {
+        $ps = [powershell]::Create(); $ps.RunspacePool = $pool
+        [void]$ps.AddScript($sb).AddArgument($t)
+        $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
+    }
+    # Wait for all calls, pumping the UI so the window doesn't freeze. Cap the
+    # wait so a hung endpoint can't wedge the load forever.
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $done = $true
+        foreach ($j in $jobs) { if (-not $j.Handle.IsCompleted) { $done = $false; break } }
+        if ($done -or $deadline.ElapsedMilliseconds -gt 9000) { break }
+        if ($Pump) {
+            [System.Windows.Forms.Application]::DoEvents()
+            if ($script:closing) { break }
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($j in $jobs) {
+        $val = $null
+        try { if ($j.Handle.IsCompleted) { $val = $j.PS.EndInvoke($j.Handle) } } catch {}
+        if ($val -is [System.Collections.IList] -and $val.Count -gt 0) { $val = $val[$val.Count - 1] }
+        $results.Add($val); try { $j.PS.Dispose() } catch {}
+    }
+    try { $pool.Close(); $pool.Dispose() } catch {}
+    return ,$results
+}
+
+# Build the account list WITHOUT shelling out to cswap, by reading the same
+# on-disk data cswap manages:
+#   - sequence.json (num, email, organizationName, uuid, activeAccountNumber)
+#   - the active account's live token from <config_home>/.credentials.json
+#   - each inactive account's token from credentials/.creds-N-email.enc (base64)
+# then fetching usage directly from the Anthropic API. Read-only: it never
+# writes credentials or refreshes tokens, so an expired/invalid token simply
+# renders "usage unavailable" — exactly as cswap shows it. Returns a list of
+# account objects (same shape as Get-AccountsViaCswap), or $null to signal "data
+# layout not recognized, use the cswap fallback".
+function Get-AccountsNative([switch]$Pump) {
+  try {
+    $userHome = $env:USERPROFILE
+    if ([string]::IsNullOrEmpty($userHome)) { $userHome = [Environment]::GetFolderPath('UserProfile') }
+    $cfgHome    = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $userHome ".claude" }
+    $backupRoot = Join-Path $userHome ".claude-swap-backup"
+    $seqPath    = Join-Path $backupRoot "sequence.json"
+    if (-not (Test-Path $seqPath)) { return $null }
+    $seq = Get-Content -Raw -LiteralPath $seqPath | ConvertFrom-Json
+    if ($null -eq $seq.accounts) { return $null }
+
+    $order = if ($seq.sequence) { @($seq.sequence) }
+             else { @($seq.accounts.PSObject.Properties.Name | Sort-Object { [int]$_ }) }
+    $activeNum = [int]$seq.activeAccountNumber
+
+    # Refine the active account from the live config's oauthAccount uuid — the
+    # real source of truth if the user logged into Claude Code outside cswap.
+    # Falls back to sequence.json's activeAccountNumber on any miss.
+    try {
+        $cfgPath = Join-Path $cfgHome ".config.json"
+        if (-not (Test-Path $cfgPath)) {
+            $base = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { $userHome }
+            $cfgPath = Join-Path $base ".claude.json"
+        }
+        if (Test-Path $cfgPath) {
+            $liveUuid = (Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json).oauthAccount.accountUuid
+            if ($liveUuid) {
+                foreach ($k in $order) {
+                    if ("$($seq.accounts.$k.uuid)" -eq "$liveUuid") { $activeNum = [int]$k; break }
+                }
+            }
+        }
+    } catch {}
+
+    $credsPath = Join-Path $cfgHome ".credentials.json"
+    $credDir   = Join-Path $backupRoot "credentials"
+    $accts  = New-Object System.Collections.Generic.List[object]
+    $tokens = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $order) {
+        $info = $seq.accounts.$k
+        if ($null -eq $info) { continue }
+        $num = [int]$k; $isActive = ($num -eq $activeNum); $email = "$($info.email)"
+        $accts.Add([pscustomobject]@{
+            Num    = $num
+            Email  = $email
+            Org    = "$($info.organizationName)"
+            Active = $isActive
+            Pct5h  = $null
+            Pct7d  = $null
+            Reset5h = ""
+            Reset7d = ""
+            Unavailable = $false
+        })
+        # Token source: live credentials for the active account, base64 backup
+        # for the rest. Any failure leaves $tok null -> "usage unavailable".
+        $tok = $null
+        try {
+            if ($isActive) {
+                if (Test-Path $credsPath) {
+                    $tok = (Get-Content -Raw -LiteralPath $credsPath | ConvertFrom-Json).claudeAiOauth.accessToken
+                }
+            } else {
+                $encPath = Join-Path $credDir ".creds-$num-$email.enc"
+                if (Test-Path $encPath) {
+                    $b64  = (Get-Content -Raw -LiteralPath $encPath).Trim()
+                    $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+                    $tok  = ($json | ConvertFrom-Json).claudeAiOauth.accessToken
+                }
+            }
+        } catch {}
+        $tokens.Add($tok)
+    }
+    # Distinguish "no accounts at all" (valid empty state) from "parsed nothing
+    # despite a non-empty sequence" (something is off -> fall back to cswap).
+    if ($accts.Count -eq 0) { if (@($order).Count -gt 0) { return $null } else { return ,$accts } }
+
+    $raws = Fetch-UsageConcurrent $tokens -Pump:$Pump
+    for ($i = 0; $i -lt $accts.Count; $i++) {
+        $acc = $accts[$i]; $raw = $raws[$i]
+        if ([string]::IsNullOrWhiteSpace("$raw")) { $acc.Unavailable = $true; continue }
+        try {
+            $u = $raw | ConvertFrom-Json
+            $h5 = $u.five_hour; $d7 = $u.seven_day
+            if ($null -eq $h5 -and $null -eq $d7) { $acc.Unavailable = $true; continue }
+            if ($h5) { $acc.Pct5h = [int][math]::Round([double]$h5.utilization); $acc.Reset5h = Format-ResetClock $h5.resets_at }
+            if ($d7) { $acc.Pct7d = [int][math]::Round([double]$d7.utilization); $acc.Reset7d = Format-ResetClock $d7.resets_at }
+        } catch { $acc.Unavailable = $true }
+    }
+    return ,$accts
+  } catch { return $null }
+}
+
+# Account list dispatcher: try the native reader first (no cswap dependency, no
+# fragile text parsing); fall back to parsing `cswap --list` if the native path
+# can't recognize the data layout. Switching accounts still goes through cswap.
 function Get-Accounts([switch]$Pump) {
+    $native = Get-AccountsNative -Pump:$Pump
+    if ($null -ne $native) { return ,$native }
+    return ,(Get-AccountsViaCswap -Pump:$Pump)
+}
+
+# Parse `cswap --list` into a list of account objects. With -Pump the UI stays
+# responsive while cswap runs (see Invoke-Cswap). Used as the FALLBACK when the
+# native reader (Get-AccountsNative) can't resolve the cswap data layout.
+function Get-AccountsViaCswap([switch]$Pump) {
     $lines = Invoke-Cswap "--list" -Pump:$Pump
     $accounts = [System.Collections.Generic.List[object]]::new()
     $current = $null
